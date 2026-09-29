@@ -1600,3 +1600,162 @@ def test_legacy_database_upgrades_with_dependency_table_and_keeps_data(tmp_path)
     assert created is False
     assert rec["payload"] == {"k": 0}
     db.close()
+
+# ---------- 阻塞根因诊断：GET /events/{event_id}/readiness ----------
+
+
+def get_readiness(client, event_id: str):
+    return client.get(f"/events/{event_id}/readiness")
+
+
+def test_readiness_not_found_returns_404(client):
+    r = get_readiness(client, "evt-ghost")
+    assert r.status_code == 404
+    assert r.json() == {"detail": "event not found"}
+
+
+def test_readiness_pending_without_dependencies_is_confirmable(client):
+    post_event(client, make_event(1))
+    r = get_readiness(client, "evt-0001")
+    assert r.status_code == 200
+    assert r.json() == {
+        "event_id": "evt-0001",
+        "status": "pending",
+        "confirmable": True,
+        "root_blockers": [],
+    }
+
+
+def test_readiness_acked_event_not_confirmable_and_no_roots(client):
+    post_event(client, make_event(1))
+    assert client.post("/events/evt-0001/ack").status_code == 200
+    r = get_readiness(client, "evt-0001")
+    assert r.status_code == 200
+    assert r.json() == {
+        "event_id": "evt-0001",
+        "status": "acked",
+        "confirmable": False,
+        "root_blockers": [],
+    }
+
+
+def test_readiness_chain_reports_terminal_pending_root_with_full_path(client):
+    # c -> b -> a，全部 pending：根因为 a，路径含两端
+    _chain(client, "c", "b", "a")
+    r = get_readiness(client, "c")
+    assert r.status_code == 200
+    assert r.json() == {
+        "event_id": "c",
+        "status": "pending",
+        "confirmable": False,
+        "root_blockers": [{"event_id": "a", "path": ["c", "b", "a"]}],
+    }
+
+
+def test_readiness_stops_tracing_through_acked_dependencies(client):
+    # c -> b -> a：ack a、b 后 c 可确认；即便 a 还有 pending 上游也不追溯
+    events = [
+        event_with_deps("c", ["b"]),
+        event_with_deps("b", ["a"]),
+        event_with_deps("a", ["root"]),
+        event_with_deps("root", []),
+    ]
+    post_batch(client, events)
+    client.post("/events/root/ack")
+    client.post("/events/a/ack")
+    client.post("/events/b/ack")
+    body = get_readiness(client, "c").json()
+    assert body["status"] == "pending"
+    assert body["confirmable"] is True
+    assert body["root_blockers"] == []
+
+
+def test_readiness_converging_branches_report_same_root_once(client):
+    # 菱形：d -> {b, c} -> a；a 为汇合后的同一根因，只返回一次
+    events = [
+        event_with_deps("d", ["b", "c"]),
+        event_with_deps("b", ["a"]),
+        event_with_deps("c", ["a"]),
+        event_with_deps("a", []),
+    ]
+    post_batch(client, events)
+    body = get_readiness(client, "d").json()
+    assert body["confirmable"] is False
+    assert body["root_blockers"] == [{"event_id": "a", "path": ["d", "b", "a"]}]
+
+
+def test_readiness_multiple_roots_sorted_by_root_id(client):
+    # child 直接依赖两个无 pending 前置的根事件
+    post_event(client, event_with_deps("r2", []))
+    post_event(client, event_with_deps("r1", []))
+    post_event(client, event_with_deps("child", ["r2", "r1"]))
+    body = get_readiness(client, "child").json()
+    assert [r["event_id"] for r in body["root_blockers"]] == ["r1", "r2"]
+    assert body["root_blockers"] == [
+        {"event_id": "r1", "path": ["child", "r1"]},
+        {"event_id": "r2", "path": ["child", "r2"]},
+    ]
+
+
+def test_readiness_shortest_path_wins(client):
+    # t 经长链到 a（t -> m1 -> m2 -> a），同时有短边 t -> a；取短路径
+    events = [
+        event_with_deps("t", ["m1", "a"]),
+        event_with_deps("m1", ["m2"]),
+        event_with_deps("m2", ["a"]),
+        event_with_deps("a", []),
+    ]
+    post_batch(client, events)
+    body = get_readiness(client, "t").json()
+    assert body["root_blockers"] == [{"event_id": "a", "path": ["t", "a"]}]
+
+
+def test_readiness_tie_breaks_by_full_id_sequence_lexicographic(client):
+    # 两条等长路径：t -> b1 -> a 与 t -> b2 -> a；整序列字典序取 b1 那条
+    events = [
+        event_with_deps("t", ["b2", "b1"]),  # 声明顺序不影响，判定与顺序无关
+        event_with_deps("b1", ["a"]),
+        event_with_deps("b2", ["a"]),
+        event_with_deps("a", []),
+    ]
+    post_batch(client, events)
+    body = get_readiness(client, "t").json()
+    assert body["root_blockers"] == [{"event_id": "a", "path": ["t", "b1", "a"]}]
+
+
+def test_readiness_mixed_depth_roots_and_branch_aggregation(client):
+    # t -> {x, y}；x 的上游为 a，y 自身为根。根因集合 {a, y}，按 ID 排序
+    events = [
+        event_with_deps("t", ["y", "x"]),
+        event_with_deps("x", ["a"]),
+        event_with_deps("y", []),
+        event_with_deps("a", []),
+    ]
+    post_batch(client, events)
+    body = get_readiness(client, "t").json()
+    assert body["confirmable"] is False
+    assert body["root_blockers"] == [
+        {"event_id": "a", "path": ["t", "x", "a"]},
+        {"event_id": "y", "path": ["t", "y"]},
+    ]
+    # 确认 a 后 x 仍 pending 并成为新的直接根因；y 依旧阻塞
+    client.post("/events/a/ack")
+    body = get_readiness(client, "t").json()
+    assert [r["event_id"] for r in body["root_blockers"]] == ["x", "y"]
+
+
+def test_readiness_matches_ack_gate_decision(client):
+    # readiness 的 confirmable 与单条确认接口的门禁结论一致
+    _chain(client, "c", "b", "a")
+    assert get_readiness(client, "c").json()["confirmable"] is False
+    assert client.post("/events/c/ack").status_code == 409
+    client.post("/events/a/ack")
+    client.post("/events/b/ack")
+    assert get_readiness(client, "c").json()["confirmable"] is True
+    assert client.post("/events/c/ack").status_code == 200
+
+
+def test_readiness_does_not_require_signature_headers(client):
+    post_event(client, make_event(1))
+    r = client.get("/events/evt-0001/readiness")
+    assert r.status_code == 200

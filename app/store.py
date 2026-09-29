@@ -243,6 +243,33 @@ def _dependencies_for(conn, event_ids: Iterable[str]) -> dict[str, list[str]]:
     return result
 
 
+def _pending_dependencies_for(conn, event_ids: Iterable[str]) -> dict[str, list[str]]:
+    """批量读取多个事件“仍为 pending 的前置”（事务内/连接锁内调用）。
+
+    与确认门禁、/events/ready 同一条判定口径：JOIN events 后仅保留
+    p.status = 'pending' 的依赖边，已 ack 的前置不构成阻塞、不出现。
+    落库引用必然存在（入箱事务保证），故不会出现悬空依赖。
+    """
+    ids = list(event_ids)
+    if not ids:
+        return {}
+    placeholders = ", ".join("?" for _ in ids)
+    result = {event_id: [] for event_id in ids}
+    rows = conn.execute(
+        f"""
+        SELECT d.event_id AS event_id, d.depends_on AS depends_on
+        FROM event_dependencies d
+        JOIN events p ON p.event_id = d.depends_on
+        WHERE d.event_id IN ({placeholders}) AND p.status = 'pending'
+        ORDER BY d.event_id, d.depends_on
+        """,
+        ids,
+    ).fetchall()
+    for row in rows:
+        result[row["event_id"]].append(row["depends_on"])
+    return result
+
+
 def encode_cursor(created_at: str, event_id: str) -> str:
     raw = json.dumps({"created_at": created_at, "event_id": event_id}, separators=(",", ":"))
     return base64.urlsafe_b64encode(raw.encode()).decode()
@@ -517,6 +544,72 @@ class EventStore:
         if row is None:
             raise EventNotFoundError(event_id)
         return _row_to_event(row, dep_map.get(event_id, []))
+
+    def trace_blocking_roots(self, event_id: str) -> dict:
+        """沿 pending 前置边追溯目标事件的最上游未确认根因。
+
+        只沿“指向前置仍 pending”的依赖边向上追溯：已 ack 的前置不构成
+        阻塞，其上游也不再追溯（沿它的路径不可能包含未确认事件）。追溯到
+        的、自身不再有 pending 前置的 pending 事件即为“最上游根因”；汇合
+        分支追溯到同一根因时只返回一次。
+
+        每个根因给出从目标到根因（含两端）的边数最少路径；等长时按整条
+        ID 序列字典序取最小者。结果按根因 event_id 排序。落库图无环
+        （入箱事务拒绝环），故按层扩展必然终止。
+
+        返回 (status, confirmable, roots)，roots 为
+        [{"event_id": ..., "path": [event_id, ...]}]。
+        - 目标 pending 且无 pending 前置：confirmable=True，根因为空；
+        - 目标 acked：confirmable=False（不可再确认），根因为空；
+        - 目标 pending 且被阻塞：confirmable=False，根因非空。
+        目标不存在抛 EventNotFoundError。
+        """
+        with self.db.lock:
+            row = self.db.conn.execute(
+                "SELECT status FROM events WHERE event_id = ?", (event_id,)
+            ).fetchone()
+            if row is None:
+                raise EventNotFoundError(event_id)
+            status = row["status"]
+            if status == STATUS_ACKED:
+                return {"status": status, "confirmable": False, "roots": []}
+
+            # 按层（边数）BFS：best[node] 为从目标到 node 的当前最优路径。
+            # 每层把候选路径按整条 ID 序列字典序排序后依次登记，节点首次
+            # 得到的路径即“最短且字典序最小”的路径，后续候选无需替换
+            # （BFS 保证后到者边数不会更少）。
+            best: dict[str, list[str]] = {event_id: [event_id]}
+            frontier = [event_id]
+            roots: dict[str, list[str]] = {}
+            while frontier:
+                pending_map = _pending_dependencies_for(self.db.conn, frontier)
+                candidates: list[list[str]] = []
+                for node in frontier:
+                    deps = pending_map[node]
+                    if not deps:
+                        if node != event_id:
+                            roots[node] = best[node]
+                        continue
+                    for dep in deps:
+                        if dep not in best:
+                            candidates.append(best[node] + [dep])
+                candidates.sort()
+                next_frontier: list[str] = []
+                for path in candidates:
+                    dep = path[-1]
+                    if dep not in best:
+                        best[dep] = path
+                        next_frontier.append(dep)
+                frontier = next_frontier
+
+            return {
+                "status": status,
+                "confirmable": not roots,
+                "roots": [
+                    {"event_id": root_id, "path": roots[root_id]}
+                    for root_id in sorted(roots)
+                ],
+            }
 
     def _list_page(self, where: str, params: list[Any], limit: int) -> dict:
         """按 (created_at, event_id) 升序的键集分页（时间游标），并附带依赖集合。"""
